@@ -150,7 +150,7 @@ class FrameLabeller:
         #step 3: label embeddings accords to centroids (using cosine similarity metrid)
         labels = self.label_faces(embeddings, frame_indices, centroids)
 
-        #clear gpu cache
+        #clear gpu cache to mitigate cuda out of memory erorr
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
