@@ -11,27 +11,28 @@ from FeatureExtractionPipeline import FeatureExtractionPipeline
 
 
 class FrameLabeller:
-    def __init__(self):
+    def __init__(self, data_points, preprocessor=None, extractor=None):
         self.device="cuda" if torch.cuda.is_available() else "cpu"
+        self.preprocessor = preprocessor or PreprocessingPipeline()
+        self.extractor = extractor or FeatureExtractionPipeline()
+        self.data_points = data_points   # <--- centroids used for classification
 
-    """
-    Sample frames every frame_rate amount of seconds
-
-    param: frame_rate, sample 1 frame every frame_rate seconds
-    param: video, mp4 file path of the video
-
-    return: list of frames
-    """
     def get_frames(self, video, interval):
-        frames = []
-        cap = cv2.VideoCapture(video)
+        """
+        Sample frames every frame_rate amount of seconds
 
+        param: frame_rate, sample 1 frame every frame_rate seconds
+        param: video, mp4 file path of the video
+
+        return: list of frames
+        """
+        frames = []
+        frames_index = []
+        cap = cv2.VideoCapture(video)
         if not cap.isOpened():
             raise IOError(f"Cannot open video file {video}")
-
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_interval = int(fps * interval)  # Number of frames to skip
-
         frame_count = 0
         while True:
             ret, frame = cap.read()
@@ -39,121 +40,137 @@ class FrameLabeller:
                 break  # End of video
             if frame_count % frame_interval == 0:
                 frames.append(frame)
+                frames_index.append(frame_count)
             frame_count += 1
         cap.release()
-        return frames
+        return frames, frames_index
 
+    def get_frame_generator(self, video, interval, batch_size):
+        """
+        Sample frames every frame_rate amount of seconds and yields every batch_size
 
-    """
-    Create facenet embeddings for one frame
+        param: frame_rate, sample 1 frame every frame_rate seconds
+        param: video, mp4 file path of the video
 
-    param: frame, ndarray of image 
+        return: list of frames
+        """
+        frames = []
+        frames_index = []
+        cap = cv2.VideoCapture(video)
+        if not cap.isOpened():
+            raise IOError(f"Cannot open video file {video}")
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_interval = int(fps * interval)
+        frame_count = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if (frame_count % frame_interval) == 0:
+                frames.append(frame)
+                frames_index.append(frame_count)
+            frame_count += 1
+            if len(frames) == batch_size:
+                yield frames, frames_index
+                frames = []
+                frames_index = []
+        #yield leftover frames that did not full batch
+        if frames:
+            yield frames, frames_index
+        cap.release()
 
-    return: N x D, N facenet embeddings of dimension D for N faces
-    """
-    def generate_embeddings(self, frame, preprocessor=None, extractor=None):
-        preprocessor = preprocessor or PreprocessingPipeline()
-        extractor = extractor or FeatureExtractionPipeline()
+    def generate_embeddings(self, frame):
+        """
+        Create facenet embeddings for one frame
 
-        normalized_images = preprocessor.preprocess_multiple(frame)
-        embeddings = extractor.batch_extract_features(normalized_images)  # batched
-
+        param: frame, ndarray of image 
+        return: N x D, N facenet embeddings of dimension D for N faces
+        """
+        normalized_faces = self.preprocessor.preprocess(frame)
+        embeddings = self.extractor.extract_features(normalized_images)
         return embeddings
 
-    """
-    Create facenet embeddings for multiple frames (batched)
+    def batch_generate_embeddings(self, frames):
+        """
+        Create facenet embeddings for each frame
 
-    param: frames: List of frames (np.ndarray)
-
-    return: (embeddings, frame_indices)
-    """
-    def batch_generate_embeddings(self, frames, preprocessor=None, extractor=None):
-        preprocessor = preprocessor or PreprocessingPipeline()
-        extractor = extractor or FeatureExtractionPipeline()
-
-        all_faces = []
-        frame_indices = []
-
-        for i, frame in enumerate(frames):
-            faces = preprocessor.preprocess_multiple(frame)
-            all_faces.extend(faces)
-            frame_indices.extend([i] * len(faces))
-
-        if not all_faces:
-            return None, []
-
-        embeddings = extractor.batch_extract_features(all_faces)
-        return embeddings, frame_indices
+        param: frame, ndarray of image 
+        return: List of N x D np.darrays, N facenet embeddings of dimension D for N faces
+        """
+        preprocessed_faces_per_frame = self.preprocessor.batch_preprocess(frames)
+        embeddings_per_frames = self.extractor.batch_extract_features(preprocessed_faces_per_frame)
+        return embeddings_per_frames
 
 
-    """
-    Assigns a label (nearest centroid) to each face embedding using cosine similarity.
+    def label_faces(self, embeddings, frame_indices):
+        """
+        Assigns a label (nearest centroid) to each face embedding using cosine similarity.
 
-    param: embeddings: torch.Tensor of shape (N, 512) — face embeddings
-    param: frame_indices: List[int] of length N — mapping each face to a frame
-    param: centroids: torch.Tensor of shape (K, 512) — known identity centroids
-    
-    return: Dictionary of in format {frame: [centroid for each face]} for each frame
-    """
-    def label_faces(self, embeddings, frame_indices, centroids):
-        if embeddings is None or len(frame_indices) == 0 or len(embeddings) == 0:
-            return [], []
-
-        #convert to tensor
-        embeddings = torch.from_numpy(embeddings).float()
-        centroids = torch.from_numpy(centroids).float()
-
-        #Note: facenet embeddings SHOUULD already be normalized!
-        #this is here as an extra precaution, but can be commented
-        #out if we are using facenet and want performance
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-        centroids = F.normalize(centroids, p=2, dim=1)
+        param: embeddings: torch.Tensor of shape (N, 512) — face embeddings
+        param: frame_indices: List[int] of length N — mapping each face to a frame
+        param: centroids: torch.Tensor of shape (K, 512) — known identity centroids
         
-        # Compute cosine similarity matrix between each embedding and each centroid
-        similarity_matrix = torch.matmul(embeddings, centroids.T)
-        # For each embedding, find the index of the centroid with highest similarity
+        return: Dictionary of in format {frame: [centroid for each face]} for each frame
+        """
+        if embeddings is None or len(frame_indices) == 0 or len(embeddings) == 0:
+            return {}
+
+        embeddings = torch.from_numpy(embeddings).float()
+        data_points = torch.from_numpy(self.data_points).float()
+
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        data_points = F.normalize(data_points, p=2, dim=1)
+
+        similarity_matrix = torch.matmul(embeddings, data_points.T)
         scores, labels = torch.max(similarity_matrix, dim=1)
 
-
-        #convert to return in format
-        #{frame1: {
-        #    label: [idx1, idx2, ...]
-        #    score: [score1, score2, ...]
-        #    }
-        #frame2: {
-        #   ...
-        #   }
-        #}
-        
         grouped = defaultdict(list)
         for frame, label, score in zip(frame_indices, labels, scores):
             grouped[frame].append({"label": label.item(), "score": score.item()})
-        
+
         return dict(grouped)
 
-
     #Full pipeline
-    """ 
-    Full pipeline that extracts embeddings out of all frames and labels them
+    def process(self, video_path, interval, batch_size=16):
+        """
+        Full pipeline for a video using batches of frames.
 
-    param: video: file path of mp4 file to be processed
-    param: centroids: N x D, N centroids of dimension D
-    param: interval to collect 1 frame per interval seconds
+        param: video_path: path to mp4
+        param: interval: seconds between frames
+        param: batch_size: number of frames per batch
 
-    return: labels in format {frameNumber: [labelIndex for each face detected]} for each frame
-    """
-    def process(self, video, centroids, interval): 
-        #Step 1: generate the frames
-        frames = self.get_frames(video, interval=interval)
-        #step 2: generate embeddings of all frames
-        embeddings, frame_indices = self.batch_generate_embeddings(frames)
-        #step 3: label embeddings accords to centroids (using cosine similarity metrid)
-        labels = self.label_faces(embeddings, frame_indices, centroids)
+        return: Dictionary {frame_number: [label dicts]} for all frames
+        """
+        all_labels = {}  # accumulate labels for all frames
+        # Use frame generator
+        for frames_batch, frames_index_batch in self.get_frame_generator(video_path, interval, batch_size):
+            # Step 1: Preprocess faces for all frames in this batch
+            preprocessed_faces_per_frame = self.preprocessor.batch_preprocess(frames_batch)
+            # Step 2: Extract embeddings for all frames (flattened internally)
+            embeddings_per_frame = self.extractor.batch_extract_features(preprocessed_faces_per_frame)
 
-        #clear gpu cache to mitigate cuda out of memory erorr
+            # Step 3: Flatten embeddings and create frame mapping
+            flat_embeddings = []
+            flat_frame_indices = []
+            for idx, frame_embeddings in enumerate(embeddings_per_frame):
+                for emb in frame_embeddings:
+                    flat_embeddings.append(emb)
+                    flat_frame_indices.append(frames_index_batch[idx])
+            if not flat_embeddings:
+                continue  # no faces detected in this batch
+            flat_embeddings = np.stack(flat_embeddings)
+            # Step 4: Label all embeddings at once
+            batch_labels = self.label_faces(flat_embeddings, flat_frame_indices)
+            # Step 5: Merge into global labels
+            for frame_num, labels_list in batch_labels.items():
+                if frame_num not in all_labels:
+                    all_labels[frame_num] = labels_list
+                else:
+                    all_labels[frame_num].extend(labels_list)
+        # Clear GPU cache
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
-        return labels
 
-
+        return all_labels
+                
+                
